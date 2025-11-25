@@ -402,7 +402,8 @@ async def maps_collect(maps_url: str, limit: int, include_no_site: bool, aggress
         context = await browser.new_context(locale="en-US")
         page = await context.new_page()
         await page.goto(maps_url, wait_until="domcontentloaded")
-        await page.wait_for_timeout(1000)
+        # Give Maps time to render the UI (especially on cold starts)
+        await page.wait_for_timeout(1500)
 
         async def collect_once():
             return await page.evaluate(r"""
@@ -463,6 +464,72 @@ async def maps_collect(maps_url: str, limit: int, include_no_site: bool, aggress
 
         list_sel = 'div[role="feed"], .m6QErb[aria-label]'
 
+        async def collect_single_place():
+            try:
+                # Try to collect details from the place details panel when there is no feed (single place URL)
+                return await page.evaluate(r"""
+(function () {
+  function text(el){ return el ? (el.textContent||'').trim() : null; }
+  function q(sel){ return document.querySelector(sel); }
+  function qa(sel){ return Array.prototype.slice.call(document.querySelectorAll(sel)); }
+  var name = text(q('h1.DUwDvf span')) || text(q('h1.DUwDvf')) || text(q('[role="main"] h1')) || null;
+  // Website button/link
+  var website = null;
+  var links = qa('a[role="link"], a[href]');
+  for (var i=0;i<links.length;i++){
+    var a = links[i];
+    var t = (a.textContent||'').toLowerCase();
+    var href = a.getAttribute('href')||'';
+    if (t.indexOf('website') !== -1 || href.indexOf('/url?q=') === 0) {
+      if (href.indexOf('/url?q=') === 0) {
+        var qs = href.split('/url?q=')[1] || '';
+        var target = qs.split('&')[0] || '';
+        try { website = decodeURIComponent(target); } catch(e) { website = target; }
+      } else if (href.indexOf('http') === 0) {
+        website = href;
+      }
+      if (website) break;
+    }
+  }
+  // Address & phone blocks often render inside the side panel details
+  var panel = q('.m6QErb') || document.body;
+  var blocks = qa('.Io6YTe, .W4Efsd, [data-item-id], [aria-label]', panel);
+  var detailsTxt = blocks.map(function(n){ return text(n)||''; }).join('\n');
+  var pm = detailsTxt.match(/\+?\d[\d\-()\s]{6,}\d/);
+  var phone = pm ? pm[0] : null;
+  var address = null;
+  // Common address selectors
+  var addrNode = q('[data-item-id="address"]') || q('button[data-item-id="address"]') || q('.W4Efsd span');
+  if (!addrNode) {
+    // fallback: first long-ish line that looks like an address
+    var lines = detailsTxt.split(/\n+/).map(function(s){return s.trim();}).filter(Boolean);
+    for (var j=0;j<lines.length;j++){
+      if (lines[j].length > 15 && /[0-9]/.test(lines[j])) { address = lines[j]; break; }
+    }
+  } else {
+    address = text(addrNode);
+  }
+  // rating and reviews
+  var rating = null, reviews = null;
+  var rn = q('[aria-label*="stars"], [aria-label*="rating"]');
+  if (rn) {
+    var al = rn.getAttribute('aria-label') || text(rn) || '';
+    var mm = al.match(/([0-9]+(?:\.[0-9]+)?)/);
+    if (mm) rating = parseFloat(mm[1]);
+  }
+  var rv = q('.UY7F9') || q('span[aria-label*="reviews"]');
+  if (rv) {
+    var txt2 = rv.getAttribute('aria-label') || text(rv) || '';
+    var mr = txt2.match(/([0-9][0-9,\.]*)/);
+    if (mr) reviews = parseInt(mr[1].replace(/[^0-9]/g, ''));
+  }
+  if (!name && !website && !phone && !address) return [];
+  return [{ name: name, website: website, phone: phone, address: address, rating: rating, reviews: reviews }];
+})()
+                """)
+            except Exception:
+                return []
+
         async def scroll_once():
             try:
                 feed = await page.query_selector(list_sel)
@@ -503,6 +570,22 @@ async def maps_collect(maps_url: str, limit: int, include_no_site: bool, aggress
         sweeps = max(0, min(tiles or 0, 50)) if grid_sweep else 0
         last_len = 0
         no_growth = 0
+
+        # If there is no feed/list visible, try single-place extraction once
+        try:
+            feed_exists = await page.query_selector(list_sel)
+        except Exception:
+            feed_exists = None
+        if not feed_exists:
+            single = await collect_single_place()
+            if single:
+                for it in single:
+                    k = key_of(it)
+                    if k in seen: continue
+                    if (not include_no_site) and (not it.get('website')): continue
+                    seen.add(k); items.append(it)
+                await context.close(); await browser.close()
+                return items[:limit]
 
         for i in range(max_iters):
             chunk = await collect_once()
